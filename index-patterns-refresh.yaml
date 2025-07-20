@@ -1,0 +1,159 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: opensearch-cluster-fluent-bit-index-patterns-refresh
+  namespace: logging
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      creationTimestamp: null
+    spec:
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          containers:
+          - args:
+            - |
+              #!/bin/sh
+
+              set -e
+
+              handle_error() {
+                echo "$(date '+%Y-%m-%d %H:%M:%S') · Error on line $1"
+                exit 1
+              }
+
+              trap 'handle_error $LINENO' ERR
+
+              OS_URL="${OS_URL:-https://opensearch-cluster:9200}"
+              OS_DASHBOARDS_URL="${OS_DASHBOARDS_URL:-https://opensearch-cluster-dashboards:5601}"
+              USERNAME="$OS_USERNAME"
+              PASSWORD="$OS_PASSWORD"
+              AUTH="-u $USERNAME:$PASSWORD"
+
+              TENANTS_RESPONSE=$(curl -s -k \
+                $AUTH \
+                "$OS_URL/_plugins/_security/api/tenants")
+
+              if [ -z "$TENANTS_RESPONSE" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') · Failed to retrieve tenants"
+                exit 1
+              fi
+
+              TENANTS=$(echo "$TENANTS_RESPONSE" | jq -r 'keys[]')
+
+              if [ -z "$TENANTS" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') · No tenants found"
+                exit 0
+              fi
+
+              for TENANT in $TENANTS; do
+                echo "$(date '+%Y-%m-%d %H:%M:%S') · Processing tenant: $TENANT"
+
+                if [ "$TENANT" = "global_tenant" ]; then
+                  TENANT_HEADER="securitytenant:global"
+                else
+                  TENANT_HEADER="securitytenant:$TENANT"
+                fi
+
+                INDEX_PATTERNS_RESPONSE=$(curl -s -k \
+                  $AUTH \
+                  -H "$TENANT_HEADER" \
+                  "$OS_DASHBOARDS_URL/api/saved_objects/_find?type=index-pattern&per_page=10000")
+
+                if [ -z "$INDEX_PATTERNS_RESPONSE" ]; then
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') · Failed to retrieve index patterns for tenant: $TENANT"
+                  continue
+                fi
+
+                INDEX_PATTERNS=$(echo "$INDEX_PATTERNS_RESPONSE" \
+                  | jq -r '.saved_objects[] | select(.attributes.title | startswith("fluent-bit-")) | .id'
+                )
+
+                if [ -z "$INDEX_PATTERNS" ]; then
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') · No index patterns starting with 'fluent-bit-' found for tenant: $TENANT"
+                  continue
+                fi
+
+                echo "$(date '+%Y-%m-%d %H:%M:%S') · Index patterns found for tenant: $TENANT:"
+                for PATTERN in $INDEX_PATTERNS; do
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') · - $PATTERN"
+                done
+
+                for INDEX_PATTERN in $INDEX_PATTERNS; do
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') · Refreshing index pattern: $INDEX_PATTERN"
+
+                  TITLE_RESPONSE=$(curl -s -k \
+                    $AUTH \
+                    -H "$TENANT_HEADER" \
+                    "$OS_DASHBOARDS_URL/api/saved_objects/index-pattern/$INDEX_PATTERN")
+
+                  if [ -z "$TITLE_RESPONSE" ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') · Failed to retrieve title for index pattern $INDEX_PATTERN in tenant: $TENANT"
+                    continue
+                  fi
+
+                  TITLE=$(echo "$TITLE_RESPONSE" | jq -r '.attributes.title')
+
+                  if [ -z "$TITLE" ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') · Title not found for index pattern $INDEX_PATTERN in tenant: $TENANT"
+                    continue
+                  fi
+
+                  RESPONSE=$(curl -XPOST -s -k -o /dev/null -w "%{http_code}" \
+                    $AUTH \
+                    "$OS_DASHBOARDS_URL/api/saved_objects/index-pattern/$INDEX_PATTERN?overwrite=true" \
+                    -H "osd-xsrf: true" \
+                    -H "Content-Type: application/json" \
+                    -H "$TENANT_HEADER" \
+                    -d '{
+                      "attributes": {
+                        "title": "'"${TITLE}"'",
+                        "timeFieldName": "@timestamp"
+                      }
+                    }'
+                  )
+
+                  if [ "$RESPONSE" -ne 200 ] && [ "$RESPONSE" -ne 201 ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') · Failed to refresh index pattern $INDEX_PATTERN for tenant: $TENANT. HTTP response code: $RESPONSE"
+                  else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') · Successfully refreshed index pattern $INDEX_PATTERN for tenant: $TENANT"
+                  fi
+                done
+              done
+            command:
+            - /bin/sh
+            - -c
+            env:
+            - name: OS_DASHBOARDS_URL
+              value: https://opensearch-cluster-dashboards:5601
+            - name: OS_URL
+              value: https://opensearch-cluster:9200
+            - name: OS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: opensearch-credentials-admin-user
+            - name: OS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: opensearch-credentials-admin-user
+            image: badouralix/curl-jq:alpine
+            imagePullPolicy: IfNotPresent
+            name: fluent-bit-index-patterns-refresh
+            resources: {}
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+          dnsPolicy: ClusterFirst
+          restartPolicy: Never
+          schedulerName: default-scheduler
+          securityContext: {}
+          terminationGracePeriodSeconds: 30
+  schedule: 15 */2 * * *
+  successfulJobsHistoryLimit: 3
+  suspend: false
