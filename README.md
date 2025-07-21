@@ -3,4 +3,5 @@
 ## Cronjob `opensearch-cluster-fluent-bit-index-patterns-refresh`
 
 [This cronjob](./index-patterns-refresh.yaml) triggers curl by cron to update all fields in OpenSearch index patterns. This prevents errors from occurring when retrieving identical fields
-with different data types. However, it should be noted that such conflicting fields will be excluded from the search.
+with different data types. However, it should be noted that such conflicting fields will be excluded from the search. Note that index-patterns with the `fluent-bit-` prefix are processed,
+but you can change it in the code.
